@@ -1,0 +1,10 @@
+# Keep examples local (large reference files)
+examples/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+
