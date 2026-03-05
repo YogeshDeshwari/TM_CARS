@@ -55,6 +55,25 @@ python3 generate_tmnf_skin.py \
 - `galaxy` - Starfield/nebula effect
 - `neon` - Neon glow lines
 
+## Research / Documentation
+
+- `docs/TMNF_SKINNING_NOTES.md`: living research log + file/channel semantics + links.
+
+## Refined workflow (TL;DR)
+
+Recommended: **reskin a known-good Stadium base zip** (keeps model files, avoids compatibility issues).
+
+- **Diffuse alpha**: treated as **finish/spec**, not transparency (neutral baseline often `0x8E`).
+- **Dirty + Illum**: generators/packagers will **auto-add** these if missing in the donor zip:
+  - `DiffuseDirty.dds` / `DetailsDirty.dds`: default “no dirt” (alpha=0), DXT5
+  - `Illum.dds`: default “no illum” (RGB=0), DXT1
+
+### Useful knobs
+
+- **Prelight shading**: `--prelight <png/tga> --prelight-strength 0.35..1.0`
+- **Finish looks “inverted”** (pack-dependent): `--finish-invert` (applies to `--finish-alpha auto`)
+- **Advanced glow** (baked illum): `--illum-image <png/tga>`
+
 ## Skin Sharing (TMUF)
 
 For other players to see your skin in multiplayer, you need `.loc` files.

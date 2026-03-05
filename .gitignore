@@ -1,10 +1,10 @@
-# Keep examples local (large reference files)
-examples/
-
-# Python cache
 __pycache__/
 *.pyc
-
-# OS files
 .DS_Store
 
+# Files over GitHub 100MB limit (compilation packs -- individual skins are still tracked)
+CH_Jan_Skins_01.zip
+CH_Jan_pack_01.zip
+out/CH_ALL_SKINS/CH_Jan_Skins.zip
+out/CH_ALL_SKINS/CH_Jan_pack_01.zip
+out/CH_ALL_SKINS/CH_Jan_pack_01 (1).zip
