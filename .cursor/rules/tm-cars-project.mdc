@@ -1,0 +1,76 @@
+---
+description: TrackMania TMNF/TMUF skin generation project -- architecture, conventions, and key knowledge
+alwaysApply: true
+---
+
+# TM_CARS Project Context
+
+## What This Project Does
+
+Procedural skin generator for TrackMania Nations Forever / United Forever (TMNF/TMUF) cars. Generates complete `.zip` skin packs containing DDS textures with proper mipmaps, ready to drop into the game's Skins folder.
+
+## Architecture
+
+### Core Pipeline
+
+1. **`skin_presets.py`** -- Preset registry. Each preset is a decorated function returning a dict with `role_spec`, `design_layers`, `hero_gradient`, `prelight`. Use `get_preset(name, size)` and `list_presets()`.
+2. **`skin_utils.py`** -- Procedural pattern generators (`generate_warp_grid`, etc.) and image helpers (`_fbm_noise`, `_turbulence_field`, `_hsv_to_rgb`, `hex_to_rgb`, `apply_material_finish`).
+3. **`pro_skin_engine.py`** -- `ProSkinEngine` class. UV-aware compositor that maps patterns to car body parts using island masks from `car_geometry.py`.
+4. **`layer_stack.py`** -- `SkinLayerStack` and `Finish` dataclass. Blend modes, per-layer finish (gloss/matte/satin).
+5. **`car_geometry.py`** -- `CarGeometry` with UV island classification. `ColorRole` enum: hero, secondary, accent, darken, neutral.
+6. **`tmnf_dds.py`** -- DDS read/write (DXT1/DXT5 with mipmaps). `save_dds_dxt5()`, `save_dds_dxt1()`, `build_dds_dxt5_bytes()`.
+7. **`generate_preset_batch.py`** -- CLI to generate skins: `python3 generate_preset_batch.py <preset_name> [preset_name2 ...]`
+
+### Texture Files in a Skin Zip
+
+- `Diffuse.dds` (DXT5, 2048x2048) -- body paint, alpha = finish/specular
+- `Details.dds` (DXT5, 2048x2048) -- tires, structural parts, wheels
+- `DiffuseDirty.dds` (DXT1, 1024x1024) -- dirt variant
+- `DetailsDirty.dds` (DXT1, 1024x1024) -- dirt variant
+- `ProjShad.dds` (DXT1) -- shadow projection
+- `Icon.dds` -- thumbnail
+- `Illum.dds` is ignored in Stadium environment
+
+### UV Mapping
+
+- `s*` prefixed objects -> Diffuse.dds (body panels: sBody, sFRFender, etc.)
+- `d*` prefixed objects -> Details.dds (tires: dFLTire, structural: dEngine, etc.)
+- UV atlas JSON at `assets/uv_atlas.json`, diagnostic PNG at `assets/uv_diag.png`
+- 27 UV islands total
+
+## Key Conventions
+
+- All pattern generators return `Image.Image` in RGBA mode
+- Preset functions take `size: int` and return `Dict[str, Any]`
+- Seeds are explicit for reproducibility
+- NumPy used for all heavy pixel math; PIL for blur/filter/save
+- No emojis anywhere (causes UnicodeEncodeError on some terminals)
+
+## Existing Skin Families
+
+- **Psychedelic warp grids**: `psych_warp_grid`, `_v2`, `_v3` (rainbow), `_cyan`, `_magenta`, `_fire`, `_toxic`, `_ultraviolet`, `_gold`
+- **Weaponized 115**: military theme with stencil numbers
+- **FruitBomb**: smiley wheels, bomb variants, no-mudguard versions
+- **Team/player skins**: gulf_spirit, jps_gold, cyber_*, shattered_ice, etc.
+
+## No-Mudguard Pipeline
+
+Use `tools/remove_guards/` (C# / GBX.NET) to surgically remove guard objects from standard `CH_2026.zip` Gbx meshes. Run via `dotnet run` from the project dir, NOT the compiled binary. This preserves UV mapping unlike swapping Gbx files from different car variants.
+
+## Adding a New Skin
+
+1. Add generator function to `skin_utils.py` if new pattern needed
+2. Register preset in `skin_presets.py` with `@_register(category, name, description)`
+3. Generate: `python3 generate_preset_batch.py <preset_name>`
+4. Output lands in `out/<preset_name>.zip`
+
+## File Size Warnings
+
+GitHub rejects files >100MB. Large compilation zips are gitignored. Individual skin zips (~5MB each) are fine.
+
+## Dependencies
+
+- Python 3.9+
+- Pillow (see requirements.txt)
+- NumPy (used extensively in generators)
+- .NET SDK (only for remove_guards tool)

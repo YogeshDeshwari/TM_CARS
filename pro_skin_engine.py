@@ -14,9 +14,9 @@ from layer_stack import SkinLayerStack, Finish, FINISH_MATTE, FINISH_SATIN, FINI
 from tmnf_dds import save_dds_dxt5, save_dds_dxt1, build_dds_dxt5_bytes, build_dds_dxt1_bytes, read_dds_dimensions_from_bytes
 from car_geometry import CarGeometry, ColorRole, FinishType, load_stadium_geometry
 
-DEFAULT_BASE_ZIP = Path("CH_all_skins/CH_2026.zip")
-UV_ATLAS_JSON = Path("out/uv_atlas/standard_stadium_islands_2048.json")
-UV_DIAG_PNG = Path("out/uv_atlas/diagnostics_2048.png")
+DEFAULT_BASE_ZIP = Path("assets/base_car/CH_2026.zip")
+UV_ATLAS_JSON = Path("assets/uv_atlas/standard_stadium_islands_2048.json")
+UV_DIAG_PNG = Path("assets/uv_atlas/diagnostics_2048.png")
 
 _FINISH_TYPE_MAP = {
     "matte":    FINISH_MATTE,
@@ -55,6 +55,8 @@ class ProSkinEngine:
         self.diffuse = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         self.details = Image.new("RGBA", (size, size), (0, 0, 0, 20))
         self.illum = Image.new("RGBA", (size, size), (0, 0, 0, 255))
+
+        self.projshad = None
 
         self._encode_finish_in_diffuse_alpha = True
         self._finish_brighten_strength = 0.35
@@ -697,6 +699,185 @@ class ProSkinEngine:
         self.diffuse = punched.copy()
         self.diffuse.putalpha(alpha)
 
+    def _fill_uv_gaps(self):
+        """Fill unpainted UV gaps between detected islands.
+
+        Our island detection covers ~67% of the texture, but the car uses ~80%.
+        We expand painted content into the gaps via iterative dilation so that
+        every visible body surface gets a colour instead of staying pure black.
+        """
+        arr = np.array(self.diffuse)
+        rgb = arr[:, :, :3]
+        alpha_ch = arr[:, :, 3].copy()
+        painted = rgb.max(axis=2) > 0
+        gap_count = (~painted).sum()
+        if gap_count < painted.size * 0.005:
+            return
+
+        gap_pct = 100.0 * gap_count / painted.size
+
+        # Iterative morphological dilation: on each pass, every black pixel
+        # that borders a non-black pixel inherits that neighbour's colour.
+        # This is much more robust than blur for very dark skins because it
+        # propagates actual edge-pixel colours rather than averaging toward 0.
+        fill = rgb.copy()
+        for _pass in range(200):
+            gaps = fill.max(axis=2) == 0
+            if not gaps.any():
+                break
+            # Shift in 4 directions and pick the first non-zero neighbour
+            filled_this = np.zeros_like(gaps)
+            for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                shifted = np.roll(np.roll(fill, dy, axis=0), dx, axis=1)
+                has_color = shifted.max(axis=2) > 0
+                take = gaps & has_color & ~filled_this
+                fill[take] = shifted[take]
+                filled_this |= take
+            if not filled_this.any():
+                break
+
+        remaining = (fill.max(axis=2) == 0).sum()
+        filled_pct = gap_pct - 100.0 * remaining / painted.size
+
+        result_img = Image.fromarray(fill, "RGB").convert("RGBA")
+        result_img.putalpha(Image.fromarray(alpha_ch, "L"))
+        self.diffuse = result_img
+        print(f"  UV gap fill: {gap_pct:.1f}% gaps -> {filled_pct:.1f}% filled")
+
+    def _clamp_black_pixels(self):
+        """Ensure no pixel is pure (0,0,0) in the final Diffuse.
+
+        Pure black can read as 'unpainted' to the game engine. We clamp to a
+        minimum of 8 per channel so the value survives DXT5 block compression
+        (which quantizes very dark colors to 0).
+        """
+        arr = np.array(self.diffuse)
+        rgb = arr[:, :, :3].astype(np.int16)
+        black = rgb.max(axis=2) < 8
+        count = black.sum()
+        if count > 0:
+            rgb = np.maximum(rgb, 8).astype(np.uint8)
+            arr[:, :, :3] = rgb
+            self.diffuse = Image.fromarray(arr, "RGBA")
+            print(f"  Black pixel clamp: {count} px floored to 8")
+
+    _dbody_mask_cache: dict = {}
+
+    _BODY_GROUPS = {"unknown0", "unknown1", "unknown2"}
+    _TIRE_GROUPS = {"unknown3", "unknown4", "unknown5", "unknown6"}
+
+    @staticmethod
+    def _build_dbody_uv_mask(obj_path: Path, tex_w: int, tex_h: int) -> Image.Image:
+        """Rasterize body UV faces into a mask, excluding tires.
+
+        Unknown0 = dBody (main body panels).
+        Unknown1 = rear wing surface, engine cover, other body detail parts.
+        Unknown3-6 = tires/wheels (subtracted so they keep base appearance).
+        """
+        cache_key = (str(obj_path), tex_w, tex_h)
+        if cache_key in ProSkinEngine._dbody_mask_cache:
+            return ProSkinEngine._dbody_mask_cache[cache_key]
+
+        uvs = []
+        group_faces = {}
+        current_group = None
+
+        with open(obj_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("vt "):
+                    p = line.split()
+                    uvs.append((float(p[1]), float(p[2])))
+                elif line.startswith("g "):
+                    current_group = line[2:].strip().lower()
+                    if current_group not in group_faces:
+                        group_faces[current_group] = []
+                elif line.startswith("f ") and current_group:
+                    ft = []
+                    for token in line.split()[1:]:
+                        parts = token.split("/")
+                        if len(parts) >= 2 and parts[1]:
+                            ft.append(int(parts[1]) - 1)
+                    if len(ft) >= 3:
+                        group_faces.setdefault(current_group, []).append(ft)
+
+        def _rasterize(face_list):
+            img = Image.new("L", (tex_w, tex_h), 0)
+            d = ImageDraw.Draw(img)
+            for ft in face_list:
+                pts = []
+                for idx in ft:
+                    if 0 <= idx < len(uvs):
+                        u, v = uvs[idx]
+                        px = max(0, min(int(u * tex_w), tex_w - 1))
+                        py = max(0, min(int((1.0 - v) * tex_h), tex_h - 1))
+                        pts.append((px, py))
+                if len(pts) >= 3:
+                    d.polygon(pts, fill=255)
+            return img
+
+        body_faces = []
+        for g in ProSkinEngine._BODY_GROUPS:
+            body_faces.extend(group_faces.get(g, []))
+        mask = _rasterize(body_faces)
+        mask = mask.filter(ImageFilter.MaxFilter(3))
+
+        tire_faces = []
+        for g in ProSkinEngine._TIRE_GROUPS:
+            tire_faces.extend(group_faces.get(g, []))
+        if tire_faces:
+            tire_mask = _rasterize(tire_faces)
+            tire_mask = tire_mask.filter(ImageFilter.MaxFilter(5))
+            mask = ImageChops.subtract(mask, tire_mask)
+
+        ProSkinEngine._dbody_mask_cache[cache_key] = mask
+        return mask
+
+    def _build_details_texture(self, base_sizes: dict) -> Image.Image:
+        """Build a Details.dds that paints our skin onto body regions.
+
+        Starts from the base pack's original Details.dds (wheels, tires
+        intact), then composites our Diffuse design over it using a mask
+        derived from body mesh groups (Unknown0+Unknown1, tires excluded).
+
+        A gamma lift is applied to the skin before pasting so that dark
+        patterns (e.g. Penrose tiles) remain visible on the wing and other
+        Details-only surfaces where the base texture is also dark.
+        """
+        det_size = base_sizes.get("Details.dds", (self.size, self.size))
+        dw, dh = det_size
+
+        base_details = None
+        if self.base_zip.exists():
+            import io as _io
+            with zipfile.ZipFile(self.base_zip, "r") as zin:
+                if "Details.dds" in {i.filename for i in zin.infolist()}:
+                    raw = zin.read("Details.dds")
+                    base_details = Image.open(_io.BytesIO(raw)).convert("RGBA")
+
+        if base_details is None:
+            base_details = Image.new("RGBA", (dw, dh), (20, 20, 22, 0))
+
+        skin_scaled = self.diffuse.resize((dw, dh), Image.Resampling.LANCZOS)
+
+        skin_rgb = np.array(skin_scaled.convert("RGB"), dtype=np.float64)
+        gamma = 0.55
+        skin_rgb = 255.0 * np.power(skin_rgb / 255.0, gamma)
+        skin_rgb = np.clip(skin_rgb, 0, 255).astype(np.uint8)
+        skin_scaled = Image.fromarray(skin_rgb, "RGB").convert("RGBA")
+        skin_scaled.putalpha(Image.new("L", (dw, dh), 0))
+
+        obj_path = Path("models/StadiumCar.obj")
+        if obj_path.exists():
+            dbody_mask = self._build_dbody_uv_mask(obj_path, dw, dh)
+            result = base_details.copy()
+            result.paste(skin_scaled, (0, 0), dbody_mask)
+        else:
+            result = base_details
+
+        print(f"  Details.dds built: {dw}x{dh} (skin on dBody mask, base elsewhere)")
+        return result
+
     def _finalize_finish_channels(self):
         """Set Diffuse alpha per-island using CarGeometry finish values.
 
@@ -887,7 +1068,9 @@ class ProSkinEngine:
         if self._pending_prelight is not None:
             self.apply_prelight(strength=self._pending_prelight, _deferred=True)
 
+        self._fill_uv_gaps()
         self._contrast_punch()
+        self._clamp_black_pixels()
         self._finalize_finish_channels()
 
         # --- PNG previews ---
@@ -901,7 +1084,10 @@ class ProSkinEngine:
         icon = self.diffuse.resize((128, 128), Image.Resampling.LANCZOS)
         icon.save(self.out_dir / "Icon.png")
 
-        projshad = self._make_projshad_image()
+        if self.projshad is not None:
+            projshad = self.projshad
+        else:
+            projshad = self._make_projshad_image()
         projshad.save(self.out_dir / "ProjShad.png")
 
         self.generate_dirty_maps()
@@ -929,14 +1115,17 @@ class ProSkinEngine:
         dirty_diff = Image.open(self.out_dir / "DiffuseDirty.png").convert("RGBA")
         dirty_det = Image.open(self.out_dir / "DetailsDirty.png").convert("RGBA")
 
-        # Details.dds uses a separate UV space (d* primitives: wheels, rims,
-        # structural details). Keep the base pack's original to avoid
-        # overwriting wheel textures with our Diffuse-space finish map.
+        details_final = self._build_details_texture(base_sizes)
+        if details_final.width > 2048 or details_final.height > 2048:
+            details_final = details_final.resize((2048, 2048), Image.Resampling.LANCZOS)
+
         replacements = {
             "Diffuse.dds":      build_dds_dxt5_bytes(_match_base_size(self.diffuse, "Diffuse.dds")),
+            "Details.dds":      build_dds_dxt5_bytes(details_final),
             "Icon.dds":         build_dds_dxt5_bytes(_match_base_size(icon, "Icon.dds")),
             "DiffuseDirty.dds": build_dds_dxt5_bytes(_match_base_size(dirty_diff, "DiffuseDirty.dds")),
             "DetailsDirty.dds": build_dds_dxt5_bytes(_match_base_size(dirty_det, "DetailsDirty.dds")),
+            "ProjShad.dds":     build_dds_dxt1_bytes(_match_base_size(projshad.convert("RGBA"), "ProjShad.dds")),
         }
         if has_illum:
             replacements["Illum.dds"] = build_dds_dxt1_bytes(self.illum)
@@ -956,6 +1145,10 @@ class ProSkinEngine:
             self._write_textures_only_zip(zip_path, replacements)
 
         print(f"ZIP: {zip_path} ({zip_path.stat().st_size / 1024:.0f} KB)")
+
+        if self.out_dir.exists():
+            shutil.rmtree(self.out_dir)
+
         print("Done.")
 
     def _build_reskinned_zip(self, out_zip: Path, replacements: dict, has_illum: bool):
@@ -968,7 +1161,7 @@ class ProSkinEngine:
             if has_illum and "Illum.dds" not in base_names:
                 additions["Illum.dds"] = replacements.pop("Illum.dds")
 
-            with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zout:
+            with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
                 for info in zin.infolist():
                     name = info.filename
                     if hasattr(info, "is_dir") and info.is_dir():

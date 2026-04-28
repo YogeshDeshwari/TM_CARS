@@ -383,7 +383,7 @@ class CarGeometry:
             1: "MAIN_BODY_SIDE",
             2: "TOP_BODY",
             3: "NOSE",
-            4: "UNDERTRAY",
+            4: "BODY_PANEL",
             5: "SIDEPOD",
             6: "SIDEPOD",
             7: "REAR_SECTION",
@@ -588,7 +588,7 @@ def load_stadium_geometry() -> CarGeometry:
     import os
     atlas_path = os.path.join(
         os.path.dirname(__file__),
-        "out/uv_atlas/standard_stadium_islands_2048.json"
+        "assets/uv_atlas/standard_stadium_islands_2048.json"
     )
     return CarGeometry.from_json_file(atlas_path)
 

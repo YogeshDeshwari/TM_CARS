@@ -1,5 +1,9 @@
+import json
 import math
 import random
+from collections import Counter
+from pathlib import Path
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 from typing import Tuple, Optional, List, Dict
@@ -1256,3 +1260,1386 @@ def generate_warp_grid(
             img_arr[:, :, ch].astype(np.int16) + grit, 0, 255).astype(np.uint8)
     out[:, :, 3] = 255
     return Image.fromarray(out, "RGBA")
+
+
+# =========================================================================
+# NEW AESTHETIC GENERATORS
+# =========================================================================
+
+def _voronoi_edge_distance(size: int, num_cells: int, seed: int):
+    """Returns (cell_map, min_dist, edge_dist) arrays for Voronoi.
+    edge_dist is the difference between the 2nd-closest and closest point
+    distances -- small values mean near an edge."""
+    rng = np.random.RandomState(seed)
+    cx = rng.rand(num_cells) * size
+    cy = rng.rand(num_cells) * size
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float64)
+    dist1 = np.full((size, size), 1e18)
+    dist2 = np.full((size, size), 1e18)
+    cell_map = np.zeros((size, size), dtype=np.int32)
+    for i in range(num_cells):
+        d = np.sqrt((xs - cx[i]) ** 2 + (ys - cy[i]) ** 2)
+        closer = d < dist1
+        dist2 = np.where(closer, dist1, dist2)
+        dist1 = np.where(closer, d, dist1)
+        cell_map = np.where(closer, i, cell_map)
+        between = (~closer) & (d < dist2)
+        dist2 = np.where(between, d, dist2)
+    edge_dist = dist2 - dist1
+    return cell_map, dist1, edge_dist
+
+
+def _double_domain_warp(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    size: int,
+    seed: int,
+    strength: float = 0.35,
+) -> tuple:
+    """Nested double domain warp (Inigo Quilez technique).
+
+    Level 1 produces displacement q from base fBM.
+    Level 2 samples fBM at q-warped positions to get r.
+    Returns (x_warped, y_warped) coordinate grids."""
+    q_x = _fbm_noise(size, 5, np.random.RandomState(seed))
+    q_y = _fbm_noise(size, 5, np.random.RandomState(seed + 73))
+
+    mid_x_px = np.clip(
+        ((x_grid + (q_x - 0.5) * strength * 4.0) * size).astype(int), 0, size - 1)
+    mid_y_px = np.clip(
+        ((y_grid + (q_y - 0.5) * strength * 4.0) * size).astype(int), 0, size - 1)
+
+    r_field_x = _fbm_noise(size, 5, np.random.RandomState(seed + 170))
+    r_field_y = _fbm_noise(size, 5, np.random.RandomState(seed + 283))
+    r_x = r_field_x[mid_y_px, mid_x_px]
+    r_y = r_field_y[mid_y_px, mid_x_px]
+
+    return (
+        x_grid + (r_x - 0.5) * strength * 4.0,
+        y_grid + (r_y - 0.5) * strength * 4.0,
+    )
+
+
+def generate_aurora(
+    size: int,
+    num_bands: int = 6,
+    band_freq: float = 4.0,
+    warp_strength: float = 0.22,
+    glow_radius: int = 0,
+    seed: int = 42,
+) -> Image.Image:
+    """Northern lights: vivid curtains on dark sky with strong dark-to-bright contrast."""
+    rng = np.random.RandomState(seed)
+    if glow_radius <= 0:
+        glow_radius = max(5, size // 32)
+
+    y, x = np.mgrid[0:size, 0:size].astype(np.float64) / size
+
+    warp = _fbm_noise(size, 5, np.random.RandomState(seed))
+    warp2 = _fbm_noise(size, 4, np.random.RandomState(seed + 50))
+    y_warped = y + (warp - 0.5) * warp_strength + (warp2 - 0.5) * warp_strength * 0.5
+
+    ray_noise = _fbm_noise(size, 6, np.random.RandomState(seed + 300))
+    ray_mask = np.clip(ray_noise * 1.5 - 0.2, 0, 1)
+
+    aurora_hsv = [
+        (130.0, 1.0,  1.0),   # vivid green
+        (175.0, 0.95, 0.90),  # teal
+        (200.0, 0.90, 0.85),  # cyan
+        (280.0, 0.92, 0.90),  # purple
+        (320.0, 0.85, 0.75),  # pink
+        (150.0, 1.0,  0.95),  # green-2
+    ]
+
+    band_strengths = rng.uniform(0.55, 1.0, num_bands)
+
+    accum = np.zeros((size, size, 3), dtype=np.float64)
+    for i in range(num_bands):
+        phase_noise = _fbm_noise(size, 4, np.random.RandomState(seed + i * 100))
+        center = 0.12 + (i / max(1, num_bands - 1)) * 0.65
+        wave = np.sin((y_warped - center) * band_freq * 2 * math.pi + phase_noise * 5.0)
+
+        dist_from_center = np.abs(y_warped - center - wave * 0.05)
+        intensity = np.clip(1.0 - dist_from_center * 6.5, 0, 1) ** 1.8
+        intensity *= np.clip(0.40 + phase_noise * 0.75, 0, 1)
+        intensity *= band_strengths[i]
+        intensity *= (0.45 + ray_mask * 0.55)
+
+        ci = i % len(aurora_hsv)
+        h_deg, s, v = aurora_hsv[ci]
+        r_ch, g_ch, b_ch = _hsv_to_rgb(
+            np.full((size, size), h_deg),
+            np.full((size, size), s),
+            intensity * v
+        )
+        accum[:, :, 0] += r_ch.astype(np.float64)
+        accum[:, :, 1] += g_ch.astype(np.float64)
+        accum[:, :, 2] += b_ch.astype(np.float64)
+
+    sky_noise = _fbm_noise(size, 4, np.random.RandomState(seed + 400))
+    sky_r = 3.0 + sky_noise * 5
+    sky_g = 4.0 + sky_noise * 6
+    sky_b = 12.0 + sky_noise * 10
+    img_arr = np.stack([sky_r + accum[:, :, 0],
+                        sky_g + accum[:, :, 1],
+                        sky_b + accum[:, :, 2]], axis=-1)
+    img_arr = np.clip(img_arr, 0, 255)
+
+    lum = np.clip(img_arr.max(axis=2), 0, 255).astype(np.uint8)
+    lum_pil = Image.fromarray(lum, "L")
+    glow = np.array(lum_pil.filter(ImageFilter.GaussianBlur(glow_radius)),
+                    dtype=np.float64) / 255.0
+    for ch in range(3):
+        img_arr[:, :, ch] = np.clip(img_arr[:, :, ch] + glow * 55, 0, 255)
+
+    grit = rng.randint(-3, 3, (size, size), dtype=np.int16)
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch].astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_deep_ocean(
+    size: int,
+    tendril_octaves: int = 6,
+    warp_strength: float = 0.6,
+    glow_strength: float = 0.7,
+    seed: int = 42,
+) -> Image.Image:
+    """Bioluminescent deep ocean: sharp ridge tendrils with depth gradient glow."""
+    rng = np.random.RandomState(seed)
+    y, x = np.mgrid[0:size, 0:size].astype(np.float64) / size
+
+    wx = _fbm_noise(size, 5, np.random.RandomState(seed))
+    wy = _fbm_noise(size, 5, np.random.RandomState(seed + 100))
+    xw = x + (wx - 0.5) * warp_strength
+    yw = y + (wy - 0.5) * warp_strength
+
+    # use turbulence with higher power for sharp ridge-like tendrils
+    turb1 = _turbulence_field(size, 6, np.random.RandomState(seed + 200))
+    turb2 = _turbulence_field(size, 5, np.random.RandomState(seed + 300))
+    # ridge noise: peaks at the ridges of turbulence (where turbulence crosses thresholds)
+    ridge = 1.0 - np.abs(turb1 - 0.5) * 2.0
+    ridge2 = 1.0 - np.abs(turb2 - 0.4) * 2.5
+    tendril_val = np.clip(ridge * 0.6 + ridge2 * 0.4, 0, 1)
+    tendril_val = tendril_val ** 2.5
+
+    # domain warp the tendrils
+    y_idx, x_idx = np.mgrid[0:size, 0:size].astype(np.float64)
+    ws = size * warp_strength * 0.5
+    xw_i = np.clip((x_idx + (wx - 0.5) * ws).astype(int), 0, size - 1)
+    yw_i = np.clip((y_idx + (wy - 0.5) * ws).astype(int), 0, size - 1)
+    tendril_val = tendril_val[yw_i, xw_i]
+
+    hue_noise = _fbm_noise(size, 3, np.random.RandomState(seed + 400))
+    hue = 155.0 + hue_noise * 65.0
+    sat = np.full((size, size), 0.92)
+    val = tendril_val * 0.90
+
+    tr, tg, tb = _hsv_to_rgb(hue, sat, val)
+
+    # depth gradient background (lighter near top, darker deeper)
+    depth_grad = np.clip(y * 0.8 + 0.2, 0, 1)
+    base_r = 3.0 + (1.0 - depth_grad) * 4
+    base_g = 5.0 + (1.0 - depth_grad) * 8
+    base_b = 14.0 + (1.0 - depth_grad) * 16
+
+    img_arr = np.stack([
+        base_r + tr.astype(np.float64),
+        base_g + tg.astype(np.float64),
+        base_b + tb.astype(np.float64),
+    ], axis=-1)
+
+    # glow bloom
+    lum = np.clip(tendril_val * 255, 0, 255).astype(np.uint8)
+    lum_pil = Image.fromarray(lum, "L")
+    glow = np.array(lum_pil.filter(ImageFilter.GaussianBlur(max(4, size // 35))),
+                    dtype=np.float64) / 255.0
+    img_arr[:, :, 0] = np.clip(img_arr[:, :, 0] + glow * 15 * glow_strength, 0, 255)
+    img_arr[:, :, 1] = np.clip(img_arr[:, :, 1] + glow * 70 * glow_strength, 0, 255)
+    img_arr[:, :, 2] = np.clip(img_arr[:, :, 2] + glow * 50 * glow_strength, 0, 255)
+
+    grit = rng.randint(-3, 3, (size, size), dtype=np.int16)
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch].astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_ink_water(
+    size: int,
+    ink_colors: Optional[List[Tuple[int, int, int]]] = None,
+    warp_levels: int = 4,
+    warp_strength: float = 0.7,
+    seed: int = 42,
+) -> Image.Image:
+    """Ink dispersing in water -- wispy tendrils with saturated centers on warm paper."""
+    rng = np.random.RandomState(seed)
+    if ink_colors is None:
+        ink_colors = [(30, 20, 80), (120, 15, 50), (10, 60, 80)]
+
+    # warm cream paper base (not too bright so inks pop)
+    water_noise = _fbm_noise(size, 5, np.random.RandomState(seed + 900))
+    fiber_noise = _fbm_noise(size, 7, np.random.RandomState(seed + 950))
+    base = np.zeros((size, size, 3), dtype=np.float64)
+    base[:, :, 0] = 212 + (water_noise - 0.5) * 12 + (fiber_noise - 0.5) * 8
+    base[:, :, 1] = 205 + (water_noise - 0.5) * 10 + (fiber_noise - 0.5) * 6
+    base[:, :, 2] = 192 + (water_noise - 0.5) * 8 + (fiber_noise - 0.5) * 5
+
+    for idx, color in enumerate(ink_colors):
+        s = seed + idx * 200
+        field = _fbm_noise(size, 6, np.random.RandomState(s))
+        # use turbulence for wispy edge detail
+        turb = _turbulence_field(size, 5, np.random.RandomState(s + 5))
+        field = np.clip(field * 0.65 + turb * 0.35, 0, 1)
+
+        for level in range(warp_levels):
+            wx = _fbm_noise(size, 5, np.random.RandomState(s + level * 50 + 10))
+            wy = _fbm_noise(size, 5, np.random.RandomState(s + level * 50 + 20))
+            y_idx, x_idx = np.mgrid[0:size, 0:size].astype(np.float64)
+            strength = warp_strength * size * (0.55 ** level)
+            x_warp = np.clip((x_idx + (wx - 0.5) * strength).astype(int), 0, size - 1)
+            y_warp = np.clip((y_idx + (wy - 0.5) * strength).astype(int), 0, size - 1)
+            field = field[y_warp, x_warp]
+
+        # sharper threshold: saturated centers, wispy thin edges
+        ink_core = np.clip((field - 0.35) * 4.0, 0, 1)
+        ink_wisp = np.clip((field - 0.25) * 2.2, 0, 1) ** 0.5
+        ink_density = ink_core * 0.75 + ink_wisp * 0.25
+
+        sat_boost = np.clip(ink_core * 1.5, 0, 1)
+        for ch in range(3):
+            ink_val = color[ch] * sat_boost + color[ch] * 0.65 * (1 - sat_boost)
+            base[:, :, ch] = base[:, :, ch] * (1 - ink_density * 0.93) + ink_val * ink_density * 0.93
+
+    grit = rng.randint(-3, 3, (size, size), dtype=np.int16)
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(base[:, :, ch].astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_acid_neon(
+    size: int,
+    num_cells: int = 50,
+    crack_width: float = 0.30,
+    neon_color: Tuple[int, int, int] = (57, 255, 20),
+    seed: int = 42,
+) -> Image.Image:
+    """Acid neon fracture: matte black cracked by glowing neon energy."""
+    rng = np.random.RandomState(seed)
+
+    cell_map, dist1, edge_dist = _voronoi_edge_distance(size, num_cells, seed)
+    cell_radius = size / np.sqrt(num_cells) / 2
+    crack_px = cell_radius * crack_width
+
+    crack = np.clip(1.0 - edge_dist / crack_px, 0, 1) ** 0.7
+
+    turb = _fbm_noise(size, 5, np.random.RandomState(seed + 100))
+    crack = crack * (0.7 + turb * 0.3)
+    crack = np.clip(crack, 0, 1)
+
+    base_noise = _fbm_noise(size, 4, np.random.RandomState(seed + 200))
+    img_arr = np.zeros((size, size, 3), dtype=np.float64)
+    img_arr[:, :, 0] = 5 + base_noise * 8
+    img_arr[:, :, 1] = 5 + base_noise * 8
+    img_arr[:, :, 2] = 5 + base_noise * 8
+
+    for ch in range(3):
+        img_arr[:, :, ch] += crack * neon_color[ch]
+
+    lum = np.clip(crack * 255, 0, 255).astype(np.uint8)
+    lum_pil = Image.fromarray(lum, "L")
+    glow = np.array(lum_pil.filter(ImageFilter.GaussianBlur(max(5, size // 25))),
+                    dtype=np.float64) / 255.0
+    for ch in range(3):
+        img_arr[:, :, ch] = np.clip(img_arr[:, :, ch] + glow * neon_color[ch] * 0.35, 0, 255)
+
+    grit = rng.randint(-3, 3, (size, size), dtype=np.int16)
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch].astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_glitch(
+    size: int,
+    num_bands: int = 40,
+    shift_strength: float = 0.08,
+    block_count: int = 25,
+    seed: int = 42,
+) -> Image.Image:
+    """Digital glitch corruption: pixel-sorted streaks, RGB split, block artifacts."""
+    rng = np.random.RandomState(seed)
+
+    noise1 = _fbm_noise(size, 5, np.random.RandomState(seed))
+    noise2 = _fbm_noise(size, 4, np.random.RandomState(seed + 50))
+    y, x = np.mgrid[0:size, 0:size].astype(np.float64) / size
+
+    base_r = np.clip(noise1 * 180 + noise2 * 60, 0, 220).astype(np.float64)
+    base_g = np.clip(noise2 * 160 + y * 40, 0, 220).astype(np.float64)
+    base_b = np.clip((noise1 * 0.4 + noise2 * 0.6) * 200 + 30, 0, 230).astype(np.float64)
+
+    band_heights = rng.randint(max(2, size // 80), max(8, size // 20), num_bands)
+    band_starts = np.cumsum(np.concatenate([[0], band_heights]))
+    for i in range(num_bands):
+        if band_starts[i] >= size:
+            break
+        y0 = band_starts[i]
+        y1 = min(size, band_starts[i] + band_heights[i])
+        shift_px = int(rng.uniform(-shift_strength, shift_strength) * size)
+        if abs(shift_px) > 1:
+            for ch_arr in [base_r, base_g, base_b]:
+                ch_arr[y0:y1] = np.roll(ch_arr[y0:y1], shift_px, axis=1)
+
+    r_shift = int(rng.uniform(3, 8) * size / 512)
+    b_shift = int(rng.uniform(-8, -3) * size / 512)
+    base_r = np.roll(base_r, r_shift, axis=1)
+    base_b = np.roll(base_b, b_shift, axis=1)
+
+    for _ in range(block_count):
+        bw = rng.randint(max(4, size // 60), max(20, size // 12))
+        bh = rng.randint(max(2, size // 120), max(8, size // 40))
+        bx = rng.randint(0, size - bw)
+        by = rng.randint(0, size - bh)
+        src_x = rng.randint(0, size - bw)
+        src_y = rng.randint(0, size - bh)
+        choice = rng.randint(0, 3)
+        if choice == 0:
+            base_r[by:by+bh, bx:bx+bw] = base_r[src_y:src_y+bh, src_x:src_x+bw]
+        elif choice == 1:
+            _colors = [(255, 20, 147), (0, 255, 255), (0, 100, 255), (255, 0, 80)]
+            c = _colors[rng.randint(0, len(_colors))]
+            base_r[by:by+bh, bx:bx+bw] = c[0]
+            base_g[by:by+bh, bx:bx+bw] = c[1]
+            base_b[by:by+bh, bx:bx+bw] = c[2]
+        else:
+            base_g[by:by+bh, bx:bx+bw] = base_g[src_y:src_y+bh, src_x:src_x+bw]
+            base_b[by:by+bh, bx:bx+bw] = base_b[src_y:src_y+bh, src_x:src_x+bw]
+
+    scanline = np.ones((size, size), dtype=np.float64)
+    scanline[::4, :] = 0.75
+    scanline[1::4, :] = 0.88
+    for arr in [base_r, base_g, base_b]:
+        arr[:] = arr * scanline
+
+    grit = rng.randint(-4, 4, (size, size), dtype=np.int16)
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    out[:, :, 0] = np.clip(base_r.astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 1] = np.clip(base_g.astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 2] = np.clip(base_b.astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_frozen(
+    size: int,
+    num_cells: int = 65,
+    frost_octaves: int = 7,
+    seed: int = 42,
+) -> Image.Image:
+    """Frozen fracture: cracked glacier ice with frost crystallization."""
+    rng = np.random.RandomState(seed)
+
+    cell_map, dist1, edge_dist = _voronoi_edge_distance(size, num_cells, seed)
+    cell_radius = size / np.sqrt(num_cells) / 2
+
+    crack = np.clip(1.0 - edge_dist / (cell_radius * 0.12), 0, 1) ** 0.3
+
+    frost = _fbm_noise(size, frost_octaves, np.random.RandomState(seed + 100))
+    frost_fine = _fbm_noise(size, 8, np.random.RandomState(seed + 150))
+    frost_pattern = np.clip(frost * 0.6 + frost_fine * 0.4, 0, 1)
+    frost_white = np.clip((frost_pattern - 0.4) * 3.0, 0, 1) ** 0.7
+
+    cell_tint = _fbm_noise(size, 3, np.random.RandomState(seed + 200))
+    y_grad = np.linspace(0, 1, size).reshape(-1, 1)
+
+    img_arr = np.zeros((size, size, 3), dtype=np.float64)
+    img_arr[:, :, 0] = 165 + cell_tint * 35 + frost_white * 50 - y_grad * 20
+    img_arr[:, :, 1] = 205 + cell_tint * 30 + frost_white * 35 - y_grad * 10
+    img_arr[:, :, 2] = 245 + cell_tint * 8 + frost_white * 8
+
+    crack_strength = 0.95
+    img_arr[:, :, 0] = img_arr[:, :, 0] * (1 - crack * crack_strength) + 8 * crack * crack_strength
+    img_arr[:, :, 1] = img_arr[:, :, 1] * (1 - crack * crack_strength) + 20 * crack * crack_strength
+    img_arr[:, :, 2] = img_arr[:, :, 2] * (1 - crack * crack_strength) + 55 * crack * crack_strength
+
+    depth = np.clip(dist1 / (cell_radius * 1.8), 0, 1)
+    for ch in range(3):
+        img_arr[:, :, ch] *= (0.93 + depth * 0.07)
+
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch], 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_dragon_scale(
+    size: int,
+    num_cells: int = 120,
+    base_hue: float = 0.0,
+    gold_edge: bool = True,
+    seed: int = 42,
+) -> Image.Image:
+    """Dragon scale: reptilian armor with convex-shaded scales and gold edges."""
+    rng = np.random.RandomState(seed)
+
+    cell_map, dist1, edge_dist = _voronoi_edge_distance(size, num_cells, seed)
+    cell_radius = size / np.sqrt(num_cells) / 2
+
+    convex = 1.0 - np.clip(dist1 / (cell_radius * 1.2), 0, 1)
+    convex = convex ** 1.3
+
+    hue_var = _fbm_noise(size, 3, np.random.RandomState(seed + 100))
+    per_cell_bright = rng.uniform(0.7, 1.0, num_cells)
+    cell_brightness = per_cell_bright[cell_map]
+
+    hue = base_hue + hue_var * 12.0
+    sat = 0.85 + convex * 0.13
+    val = 0.18 + convex * 0.55 * cell_brightness
+
+    r, g, b = _hsv_to_rgb(hue, sat, val)
+    img_arr = np.stack([r.astype(np.float64), g.astype(np.float64), b.astype(np.float64)], axis=-1)
+
+    if gold_edge:
+        edge_mask = np.clip(1.0 - edge_dist / (cell_radius * 0.06), 0, 1) ** 0.4
+        img_arr[:, :, 0] = np.clip(img_arr[:, :, 0] + edge_mask * 210, 0, 255)
+        img_arr[:, :, 1] = np.clip(img_arr[:, :, 1] + edge_mask * 170, 0, 255)
+        img_arr[:, :, 2] = np.clip(img_arr[:, :, 2] + edge_mask * 30, 0, 255)
+
+    flake = _fbm_noise(size, 7, np.random.RandomState(seed + 200))
+    flake_mask = np.clip((flake - 0.5) * 3.0, 0, 1) * convex * 0.05
+    for ch in range(3):
+        img_arr[:, :, ch] = np.clip(img_arr[:, :, ch] + flake_mask * 30, 0, 255)
+
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch], 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_chevron(
+    size: int,
+    color_a: Tuple[int, int, int] = (220, 200, 20),
+    color_b: Tuple[int, int, int] = (15, 15, 15),
+    stripe_width: int = 0,
+    seed: int = 42,
+) -> Image.Image:
+    """Clean diagonal chevron stripes in two alternating colors."""
+    rng = np.random.RandomState(seed)
+    if stripe_width <= 0:
+        stripe_width = max(20, size // 16)
+
+    y_idx, x_idx = np.mgrid[0:size, 0:size].astype(np.float64)
+    diag = (x_idx + y_idx).astype(int) % (stripe_width * 2)
+    is_a = diag < stripe_width
+
+    img_arr = np.zeros((size, size, 3), dtype=np.float64)
+    for ch in range(3):
+        img_arr[:, :, ch] = np.where(is_a, color_a[ch], color_b[ch])
+
+    noise = _fbm_noise(size, 4, np.random.RandomState(seed + 50))
+    for ch in range(3):
+        img_arr[:, :, ch] += (noise - 0.5) * 12
+
+    grit = rng.randint(-3, 3, (size, size), dtype=np.int16)
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch].astype(np.int16) + grit, 0, 255).astype(np.uint8)
+    out[:, :, 3] = 255
+    return Image.fromarray(out, "RGBA")
+
+
+# =========================================================================
+# ART-INSPIRED GENERATORS
+# =========================================================================
+
+
+# ---------------------------------------------------------------------------
+# POLLOCK DRIP  (4-layer fractal splatter system)
+# ---------------------------------------------------------------------------
+
+def generate_pollock_drip(
+    size: int,
+    drip_colors: Optional[List[Tuple[int, int, int]]] = None,
+    bg_color: Tuple[int, int, int] = (15, 14, 12),
+    num_drip_lines: int = 80,
+    num_splatter_bursts: int = 120,
+    num_fine_lines: int = 50,
+    seed: int = 42,
+) -> Image.Image:
+    """Jackson Pollock drip painting: fractal splatter in 4 layers.
+
+    Core math (based on fractal analysis of real Pollock paintings):
+    1. Background: dark base with subtle turbulence texture.
+    2. Drip lines (random walk): start at random position, advance with
+       angle = prev_angle + Gaussian_perturbation. Width varies with
+       "velocity" (step size). Multiple color passes.
+    3. Splatter bursts: at random positions, scatter N particles with
+       Gaussian-distributed offsets and power-law size distribution
+       (many small dots, few large ones). This creates the fractal
+       dimension ~1.5 characteristic of real Pollocks.
+    4. Fine overlay: thin random-walk lines in contrasting color.
+    """
+    rng = np.random.RandomState(seed)
+    if drip_colors is None:
+        drip_colors = [
+            (235, 230, 220),  # off-white
+            (200, 45, 30),    # red
+            (30, 35, 40),     # dark
+            (55, 120, 170),   # blue
+            (220, 195, 50),   # yellow
+        ]
+
+    img = Image.new("RGBA", (size, size), bg_color + (255,))
+
+    # layer 1: background texture
+    bg_turb = _turbulence_field(size, 5, np.random.RandomState(seed))
+    bg_arr = np.array(img)
+    for ch in range(3):
+        bg_arr[:, :, ch] = np.clip(
+            bg_arr[:, :, ch].astype(np.float64) + (bg_turb - 0.5) * 12,
+            0, 255).astype(np.uint8)
+    img = Image.fromarray(bg_arr, "RGBA")
+    draw = ImageDraw.Draw(img)
+
+    # layer 2: drip lines (random walk)
+    for _ in range(num_drip_lines):
+        color = drip_colors[rng.randint(0, len(drip_colors))]
+        color = tuple(max(0, min(255, c + rng.randint(-15, 16))) for c in color)
+        x = rng.uniform(0, size)
+        y = rng.uniform(0, size)
+        angle = rng.uniform(0, 2 * math.pi)
+        steps = rng.randint(30, 200)
+        w = rng.randint(1, max(2, size // 200))
+        pts = [(int(x), int(y))]
+        for _ in range(steps):
+            angle += rng.normal(0, 0.35)
+            step = rng.uniform(2, max(3, size * 0.015))
+            x += step * math.cos(angle)
+            y += step * math.sin(angle)
+            pts.append((int(x), int(y)))
+        if len(pts) > 2:
+            draw.line(pts, fill=color + (rng.randint(140, 255),), width=w)
+
+    # layer 3: splatter bursts (power-law particle sizes)
+    for _ in range(num_splatter_bursts):
+        color = drip_colors[rng.randint(0, len(drip_colors))]
+        cx = rng.randint(0, size)
+        cy = rng.randint(0, size)
+        n_particles = rng.randint(5, 40)
+        for _ in range(n_particles):
+            # power-law size: many small, few large
+            radius = max(1, int(rng.pareto(2.5) * 1.5 + 1))
+            radius = min(radius, max(2, size // 60))
+            ox = int(rng.normal(0, max(3, size * 0.015)))
+            oy = int(rng.normal(0, max(3, size * 0.015)))
+            px, py = cx + ox, cy + oy
+            alpha = rng.randint(120, 255)
+            jc = tuple(max(0, min(255, c + rng.randint(-20, 21))) for c in color)
+            draw.ellipse(
+                [px - radius, py - radius, px + radius, py + radius],
+                fill=jc + (alpha,))
+
+    # layer 4: fine overlay lines
+    for _ in range(num_fine_lines):
+        color = drip_colors[rng.randint(0, len(drip_colors))]
+        x = rng.uniform(0, size)
+        y = rng.uniform(0, size)
+        angle = rng.uniform(0, 2 * math.pi)
+        steps = rng.randint(50, 300)
+        pts = [(int(x), int(y))]
+        for _ in range(steps):
+            angle += rng.normal(0, 0.25)
+            step = rng.uniform(1, max(2, size * 0.008))
+            x += step * math.cos(angle)
+            y += step * math.sin(angle)
+            pts.append((int(x), int(y)))
+        if len(pts) > 2:
+            draw.line(pts, fill=color + (rng.randint(80, 200),), width=1)
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# POLLOCK DRIP V2  (cyberpunk neon palette on dark, same fractal engine)
+# ---------------------------------------------------------------------------
+
+def generate_pollock_drip_v2(
+    size: int,
+    drip_colors: Optional[List[Tuple[int, int, int]]] = None,
+    bg_color: Tuple[int, int, int] = (8, 5, 18),
+    num_drip_lines: int = 90,
+    num_splatter_bursts: int = 140,
+    num_fine_lines: int = 60,
+    seed: int = 42,
+) -> Image.Image:
+    """Pollock drip V2: cyberpunk neon palette on near-black violet base.
+
+    Same 4-layer fractal splatter system as V1 but tuned for a cyberpunk
+    aesthetic:
+    - Deep dark violet/black background instead of warm brown
+    - Neon magenta, electric cyan, acid green, hot pink, UV purple drips
+    - Higher splatter density for more chaotic energy
+    - Drip lines are slightly thicker with more aggressive angular turns
+    - Splatter bursts use wider spread for explosive feel
+    - Fine overlay lines in cooler tones with higher alpha variance
+    - Background turbulence tinted toward purple/blue
+    """
+    rng = np.random.RandomState(seed)
+    if drip_colors is None:
+        drip_colors = [
+            (255, 0, 110),    # hot magenta / neon pink
+            (0, 255, 220),    # electric cyan
+            (180, 0, 255),    # UV purple
+            (0, 240, 80),     # acid green
+            (255, 60, 180),   # bubblegum pink
+            (80, 120, 255),   # electric blue
+        ]
+
+    img = Image.new("RGBA", (size, size), bg_color + (255,))
+
+    # layer 1: dark background with purple-tinted turbulence
+    bg_turb = _turbulence_field(size, 5, np.random.RandomState(seed))
+    bg_arr = np.array(img).astype(np.float64)
+    bg_arr[:, :, 0] += (bg_turb - 0.5) * 8
+    bg_arr[:, :, 1] += (bg_turb - 0.5) * 5
+    bg_arr[:, :, 2] += (bg_turb - 0.5) * 15
+    bg_arr = np.clip(bg_arr, 0, 255).astype(np.uint8)
+    img = Image.fromarray(bg_arr, "RGBA")
+    draw = ImageDraw.Draw(img)
+
+    # layer 2: drip lines -- more aggressive random walk, slightly thicker
+    for _ in range(num_drip_lines):
+        color = drip_colors[rng.randint(0, len(drip_colors))]
+        color = tuple(max(0, min(255, c + rng.randint(-20, 21))) for c in color)
+        x = rng.uniform(0, size)
+        y = rng.uniform(0, size)
+        angle = rng.uniform(0, 2 * math.pi)
+        steps = rng.randint(40, 250)
+        w = rng.randint(1, max(3, size // 150))
+        pts = [(int(x), int(y))]
+        for _ in range(steps):
+            angle += rng.normal(0, 0.40)
+            step = rng.uniform(2, max(4, size * 0.018))
+            x += step * math.cos(angle)
+            y += step * math.sin(angle)
+            pts.append((int(x), int(y)))
+        if len(pts) > 2:
+            draw.line(pts, fill=color + (rng.randint(150, 255),), width=w)
+
+    # layer 3: splatter bursts -- wider spread, more particles
+    for _ in range(num_splatter_bursts):
+        color = drip_colors[rng.randint(0, len(drip_colors))]
+        cx = rng.randint(0, size)
+        cy = rng.randint(0, size)
+        n_particles = rng.randint(8, 50)
+        for _ in range(n_particles):
+            radius = max(1, int(rng.pareto(2.2) * 1.8 + 1))
+            radius = min(radius, max(3, size // 50))
+            ox = int(rng.normal(0, max(4, size * 0.02)))
+            oy = int(rng.normal(0, max(4, size * 0.02)))
+            px, py = cx + ox, cy + oy
+            alpha = rng.randint(130, 255)
+            jc = tuple(max(0, min(255, c + rng.randint(-25, 26))) for c in color)
+            draw.ellipse(
+                [px - radius, py - radius, px + radius, py + radius],
+                fill=jc + (alpha,))
+
+    # layer 4: fine overlay lines -- cooler tones, thinner
+    for _ in range(num_fine_lines):
+        color = drip_colors[rng.randint(0, len(drip_colors))]
+        x = rng.uniform(0, size)
+        y = rng.uniform(0, size)
+        angle = rng.uniform(0, 2 * math.pi)
+        steps = rng.randint(60, 350)
+        pts = [(int(x), int(y))]
+        for _ in range(steps):
+            angle += rng.normal(0, 0.28)
+            step = rng.uniform(1, max(2, size * 0.009))
+            x += step * math.cos(angle)
+            y += step * math.sin(angle)
+            pts.append((int(x), int(y)))
+        if len(pts) > 2:
+            draw.line(pts, fill=color + (rng.randint(70, 210),), width=1)
+
+    return img
+
+
+# =========================================================================
+# SIMULATION-BASED GENERATORS (real PDE / ODE / growth simulations)
+# =========================================================================
+
+
+# ---------------------------------------------------------------------------
+# 1. REACTION-DIFFUSION  (Gray-Scott PDE, 9-point Laplacian stencil)
+# ---------------------------------------------------------------------------
+
+def _palette_map(field, palette, size):
+    """Map a normalized [0,1] field through a color palette. Returns (H,W,3) float64."""
+    n_stops = len(palette)
+    img_arr = np.zeros((size, size, 3), dtype=np.float64)
+    for ch in range(3):
+        for i in range(n_stops - 1):
+            lo = i / (n_stops - 1)
+            hi = (i + 1) / (n_stops - 1)
+            mask = (field >= lo) & (field < hi)
+            t = np.clip((field - lo) / (hi - lo + 1e-9), 0, 1)
+            img_arr[:, :, ch] = np.where(
+                mask, palette[i][ch] * (1 - t) + palette[i + 1][ch] * t,
+                img_arr[:, :, ch])
+        img_arr[:, :, ch] = np.where(field >= 1.0 - 0.001, palette[-1][ch], img_arr[:, :, ch])
+    return img_arr
+
+
+def generate_reaction_diffusion(
+    size: int,
+    feed: float = 0.035,
+    kill: float = 0.065,
+    du: float = 1.0,
+    dv: float = 0.5,
+    steps: int = 6000,
+    palette: Optional[List[Tuple[int, int, int]]] = None,
+    gamma: float = 1.0,
+    seed: int = 42,
+) -> Image.Image:
+    """Gray-Scott reaction-diffusion producing intricate organic patterns.
+
+    Default f/k now targets labyrinthine worm/maze regime instead of
+    the blobby spot regime. Simulation runs on a 384x384 grid for
+    finer detail (4x detail per pixel vs the old 256).
+
+    V concentration is normalized to its actual dynamic range and
+    gamma-corrected for palette contrast control.
+    """
+    rng = np.random.RandomState(seed)
+    sim_res = 384
+
+    U = np.ones((sim_res, sim_res), dtype=np.float64)
+    V = np.zeros((sim_res, sim_res), dtype=np.float64)
+
+    # dense seeding: many small patches across the whole grid
+    n_seeds = rng.randint(40, 70)
+    for _ in range(n_seeds):
+        cx = rng.randint(0, sim_res)
+        cy = rng.randint(0, sim_res)
+        r = rng.randint(3, max(4, sim_res // 25))
+        yy, xx = np.ogrid[-cy:sim_res - cy, -cx:sim_res - cx]
+        disk = xx * xx + yy * yy <= r * r
+        U[disk] = 0.50 + rng.uniform(-0.04, 0.04)
+        V[disk] = 0.25 + rng.uniform(-0.04, 0.04)
+
+    def _laplacian(grid):
+        return (
+            np.roll(grid, 1, axis=0) * 0.20 +
+            np.roll(grid, -1, axis=0) * 0.20 +
+            np.roll(grid, 1, axis=1) * 0.20 +
+            np.roll(grid, -1, axis=1) * 0.20 +
+            np.roll(np.roll(grid, 1, axis=0), 1, axis=1) * 0.05 +
+            np.roll(np.roll(grid, 1, axis=0), -1, axis=1) * 0.05 +
+            np.roll(np.roll(grid, -1, axis=0), 1, axis=1) * 0.05 +
+            np.roll(np.roll(grid, -1, axis=0), -1, axis=1) * 0.05 +
+            grid * (-1.0)
+        )
+
+    dt = 1.0
+    for _ in range(steps):
+        lap_u = _laplacian(U)
+        lap_v = _laplacian(V)
+        uvv = U * V * V
+        U += dt * (du * lap_u - uvv + feed * (1.0 - U))
+        V += dt * (dv * lap_v + uvv - (feed + kill) * V)
+        U = np.clip(U, 0, 1)
+        V = np.clip(V, 0, 1)
+
+    # Composite field: V gives sharp pattern, (1-U) gives smooth gradient everywhere
+    v_n = V.copy()
+    v_min, v_max = v_n.min(), v_n.max()
+    if v_max - v_min > 1e-9:
+        v_n = (v_n - v_min) / (v_max - v_min)
+
+    u_inv = 1.0 - U
+    u_min, u_max = u_inv.min(), u_inv.max()
+    if u_max - u_min > 1e-9:
+        u_inv = (u_inv - u_min) / (u_max - u_min)
+
+    # V peaks carry the bright pattern; U-inverse fills the canvas with
+    # smooth gradation so no pixel is dead-dark
+    field = np.clip(v_n * 0.65 + u_inv * 0.35, 0, 1)
+
+    if gamma != 1.0:
+        field = np.power(field, gamma)
+
+    # sharpen boundaries with unsharp mask
+    field_img = Image.fromarray((field * 255).astype(np.uint8), "L")
+    blurred = field_img.filter(ImageFilter.GaussianBlur(2))
+    sharp = np.clip(
+        np.array(field_img, dtype=np.float64) * 1.4 -
+        np.array(blurred, dtype=np.float64) * 0.4,
+        0, 255)
+    field_img = Image.fromarray(sharp.astype(np.uint8), "L")
+
+    if sim_res != size:
+        field_img = field_img.resize((size, size), Image.BICUBIC)
+    field_up = np.array(field_img, dtype=np.float64) / 255.0
+
+    if palette is None:
+        palette = [
+            (15, 10, 40),
+            (35, 5, 90),
+            (0, 160, 200),
+            (255, 0, 100),
+            (255, 230, 255),
+        ]
+
+    img_arr = _palette_map(field_up, palette, size)
+    alpha = np.clip(110 + field_up * 145, 110, 255)
+
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch], 0, 255).astype(np.uint8)
+    out[:, :, 3] = alpha.astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
+# =========================================================================
+# PREMIUM SKIN GENERATORS (2026 -- dedicated techniques per skin)
+# =========================================================================
+
+
+def generate_damascus_steel(
+    size: int,
+    warp_strength: float = 0.50,
+    band_levels: int = 6,
+    seed: int = 42,
+) -> Image.Image:
+    """Damascus steel V4: broader flowing bands, warm steel tint, no blowout.
+
+    Changes from V3:
+    - Stronger warp (0.50) so all panels get organic flow, not linear stripes
+    - Fewer band_levels (6) for broader, more readable layers at game distance
+    - Lower sine frequencies for wider bands
+    - Stronger x_drift so bands flow diagonally, not just horizontally
+    - Warm steel tint (slight gold shift)
+    - Bright end capped at 215 to prevent white blowout
+    - Softer edge highlights (40 not 55) to stay within metal range
+    """
+    rng = np.random.RandomState(seed)
+    y, x = np.mgrid[0:size, 0:size].astype(np.float64) / size
+
+    xw, yw = _double_domain_warp(x, y, size, seed, warp_strength)
+
+    turb = _turbulence_field(size, 5, np.random.RandomState(seed + 10))
+    turb2 = _turbulence_field(size, 4, np.random.RandomState(seed + 20))
+
+    freqs = [4.5, 7.0, 10.0, 14.0]
+    x_drifts = [0.5, -0.35, 0.25, -0.18]
+    weights = [0.38, 0.28, 0.20, 0.14]
+    turb_amps = [4.0, 3.2, 2.4, 1.6]
+
+    pattern = np.zeros((size, size), dtype=np.float64)
+    for f, xd, w, ta in zip(freqs, x_drifts, weights, turb_amps):
+        band = np.sin(
+            yw * 2 * math.pi * f
+            + xw * 2 * math.pi * xd
+            + turb * ta
+            + turb2 * ta * 0.4
+        )
+        pattern += band * w
+
+    mn, mx = pattern.min(), pattern.max()
+    if mx - mn > 1e-9:
+        pattern = (pattern - mn) / (mx - mn)
+
+    quant = np.floor(pattern * band_levels) / band_levels
+    frac = pattern * band_levels - np.floor(pattern * band_levels)
+
+    edge_hi = np.clip(1.0 - frac / 0.12, 0, 1)
+    edge_lo = np.clip((frac - 0.88) / 0.12, 0, 1)
+
+    # warm steel palette: slight gold/bronze push in the brights
+    dark = np.array([10.0, 9.0, 8.0])
+    bright = np.array([210.0, 205.0, 195.0])
+
+    img_arr = np.zeros((size, size, 3), dtype=np.float64)
+    for ch in range(3):
+        img_arr[:, :, ch] = dark[ch] + quant * (bright[ch] - dark[ch])
+
+    for ch in range(3):
+        img_arr[:, :, ch] = np.clip(
+            img_arr[:, :, ch] + edge_hi * 40 - edge_lo * 30, 0, 255)
+
+    # anisotropic brushed grain (stretched horizontally for steel feel)
+    grain_raw = _fbm_noise(size, 4, np.random.RandomState(seed + 300))
+    grain_img = Image.fromarray(
+        (grain_raw * 255).astype(np.uint8), "L"
+    ).resize((size, max(1, size // 10)), Image.BICUBIC).resize(
+        (size, size), Image.BICUBIC)
+    grain = np.array(grain_img, dtype=np.float64) / 255.0
+    for ch in range(3):
+        img_arr[:, :, ch] += (grain - 0.5) * 12
+
+    # large-scale brightness variation for natural forge inconsistency
+    bright_var = _fbm_noise(size, 2, np.random.RandomState(seed + 400))
+    for ch in range(3):
+        img_arr[:, :, ch] *= (0.90 + bright_var * 0.20)
+
+    # clamp to steel range -- nothing goes above 220 or below 6
+    for ch in range(3):
+        img_arr[:, :, ch] = np.clip(img_arr[:, :, ch], 6, 220)
+
+    # per-pixel specular alpha: polished bright bands = glossy, dark etched = matte
+    alpha_lo = 85.0
+    alpha_hi = 230.0
+    alpha = alpha_lo + quant * (alpha_hi - alpha_lo)
+    alpha = np.clip(alpha + edge_hi * 25, alpha_lo, alpha_hi)
+
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(img_arr[:, :, ch], 0, 255).astype(np.uint8)
+    out[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGBA")
+
+
+# =========================================================================
+# ART-INSPIRED GENERATORS (2026 batch)
+# =========================================================================
+
+def generate_bismuth_crystal(
+    size: int,
+    num_cells: int = 55,
+    terrace_levels: int = 8,
+    seed: int = 9000,
+) -> Image.Image:
+    """Bismuth hopper-crystal pattern: Voronoi cells with quantised staircase
+    depth and iridescent rainbow oxidation tint.  Returns RGBA."""
+    rng = np.random.RandomState(seed)
+    cx = rng.randint(0, size, num_cells).astype(np.float64)
+    cy = rng.randint(0, size, num_cells).astype(np.float64)
+
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float64)
+    cell_map = np.zeros((size, size), dtype=np.int32)
+    min_dist = np.full((size, size), 1e18, dtype=np.float64)
+
+    for i in range(num_cells):
+        d = np.sqrt((xs - cx[i]) ** 2 + (ys - cy[i]) ** 2)
+        closer = d < min_dist
+        cell_map[closer] = i
+        min_dist[closer] = d[closer]
+
+    max_d = min_dist.max() + 1e-9
+    norm_dist = min_dist / max_d
+
+    terrace = np.floor(norm_dist * terrace_levels) / terrace_levels
+    frac = norm_dist * terrace_levels - np.floor(norm_dist * terrace_levels)
+
+    hue = (cell_map.astype(np.float64) * 137.508 + terrace * 60.0) % 360.0
+    sat = 0.55 + terrace * 0.35
+    val = 0.35 + (1.0 - terrace) * 0.60
+
+    edge_highlight = np.clip(1.0 - frac / 0.10, 0, 1) * 0.25
+    val = np.clip(val + edge_highlight, 0, 1)
+
+    h_norm = hue / 360.0
+    r, g, b = _hsv_to_rgb(h_norm, sat, val)
+
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    out[:, :, 0] = np.clip(r * 255, 0, 255).astype(np.uint8)
+    out[:, :, 1] = np.clip(g * 255, 0, 255).astype(np.uint8)
+    out[:, :, 2] = np.clip(b * 255, 0, 255).astype(np.uint8)
+
+    # specular alpha: stepped terrace edges are glossier
+    alpha = 140 + (1.0 - terrace) * 80 + edge_highlight * 100
+    out[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+
+    # cell-boundary edges: dark metallic lines
+    edges = np.zeros((size, size), dtype=np.float64)
+    edges[:-1, :] = np.where(cell_map[:-1, :] != cell_map[1:, :], 1.0, edges[:-1, :])
+    edges[:, :-1] = np.where(cell_map[:, :-1] != cell_map[:, 1:], 1.0, edges[:, :-1])
+    edge_blur = np.array(
+        Image.fromarray((edges * 255).astype(np.uint8), "L").filter(
+            ImageFilter.GaussianBlur(1.2)
+        ), dtype=np.float64
+    ) / 255.0
+    for ch in range(3):
+        out[:, :, ch] = np.clip(
+            out[:, :, ch].astype(np.float64) * (1.0 - edge_blur * 0.7), 0, 255
+        ).astype(np.uint8)
+
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_rothko_field(
+    size: int,
+    bg_color: Tuple[int, int, int] = (15, 8, 25),
+    rect_colors: Optional[List[Tuple[int, int, int]]] = None,
+    seed: int = 9100,
+) -> Image.Image:
+    """Rothko-style colour-field painting: 2-3 soft-edged luminous rectangles
+    on a dark ground.  Returns RGBA."""
+    rng = np.random.RandomState(seed)
+    if rect_colors is None:
+        rect_colors = [(180, 30, 30), (220, 160, 20)]
+
+    img = np.zeros((size, size, 4), dtype=np.uint8)
+    img[:, :, 0] = bg_color[0]
+    img[:, :, 1] = bg_color[1]
+    img[:, :, 2] = bg_color[2]
+    img[:, :, 3] = 200
+
+    n_rects = len(rect_colors)
+    band_h = size // (n_rects + 1)
+    margin_x = int(size * 0.08)
+
+    for i, col in enumerate(rect_colors):
+        y_centre = int(size * (i + 1) / (n_rects + 1))
+        y0 = max(0, y_centre - band_h // 2)
+        y1 = min(size, y_centre + band_h // 2)
+        x0 = margin_x + rng.randint(-size // 40, size // 40)
+        x1 = size - margin_x + rng.randint(-size // 40, size // 40)
+
+        rect_layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(rect_layer)
+        draw.rectangle([x0, y0, x1, y1], fill=col + (220,))
+
+        # heavy blur for the signature Rothko soft edge
+        blur_radius = int(size * 0.04)
+        rect_layer = rect_layer.filter(ImageFilter.GaussianBlur(blur_radius))
+
+        # subtle noise modulation inside the rectangle
+        noise = _fbm_noise(size, 3, np.random.RandomState(seed + 50 + i))
+        rect_arr = np.array(rect_layer, dtype=np.float64)
+        for ch in range(3):
+            rect_arr[:, :, ch] *= (0.85 + noise * 0.30)
+        rect_arr = np.clip(rect_arr, 0, 255).astype(np.uint8)
+        rect_layer = Image.fromarray(rect_arr, "RGBA")
+
+        base = Image.fromarray(img, "RGBA")
+        base = Image.alpha_composite(base, rect_layer)
+        img = np.array(base)
+
+    # global atmosphere noise
+    atmos = _fbm_noise(size, 2, np.random.RandomState(seed + 99))
+    for ch in range(3):
+        img[:, :, ch] = np.clip(
+            img[:, :, ch].astype(np.float64) + (atmos - 0.5) * 14, 0, 255
+        ).astype(np.uint8)
+
+    img[:, :, 3] = np.clip(180 + (atmos * 40).astype(np.int32), 140, 230).astype(np.uint8)
+    return Image.fromarray(img, "RGBA")
+
+
+def generate_cellular_automata(
+    size: int,
+    rule_steps: int = 120,
+    fill_ratio: float = 0.38,
+    palette: Optional[List[Tuple[int, int, int]]] = None,
+    seed: int = 9200,
+) -> Image.Image:
+    """Conway's Game of Life evolved into a maze-like pattern, mapped to a
+    neon colour palette.  Returns RGBA."""
+    rng = np.random.RandomState(seed)
+    if palette is None:
+        palette = [(5, 5, 15), (0, 200, 255), (255, 0, 160), (255, 255, 255)]
+
+    grid_dim = min(512, size)
+    grid = (rng.rand(grid_dim, grid_dim) < fill_ratio).astype(np.uint8)
+
+    for _ in range(rule_steps):
+        nbrs = np.zeros_like(grid, dtype=np.int32)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                nbrs += np.roll(np.roll(grid, dy, axis=0), dx, axis=1).astype(np.int32)
+        birth = (grid == 0) & (nbrs == 3)
+        survive = (grid == 1) & ((nbrs == 2) | (nbrs == 3))
+        grid = (birth | survive).astype(np.uint8)
+
+    # distance transform: for each dead cell, distance to nearest alive cell
+    alive_f = grid.astype(np.float64)
+    alive_big = np.array(
+        Image.fromarray((alive_f * 255).astype(np.uint8), "L").resize(
+            (size, size), Image.NEAREST
+        ), dtype=np.float64
+    ) / 255.0
+
+    blur_field = np.array(
+        Image.fromarray((alive_big * 255).astype(np.uint8), "L").filter(
+            ImageFilter.GaussianBlur(size // 80)
+        ), dtype=np.float64
+    ) / 255.0
+
+    n_pal = len(palette)
+    idx = np.clip((blur_field * (n_pal - 1)).astype(np.int32), 0, n_pal - 1)
+
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for i, col in enumerate(palette):
+        mask = idx == i
+        for ch in range(3):
+            out[:, :, ch] = np.where(mask, col[ch], out[:, :, ch])
+    out[:, :, 3] = np.clip(160 + blur_field * 80, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_topographic_agate(
+    size: int,
+    band_count: int = 28,
+    palette: Optional[List[Tuple[int, int, int]]] = None,
+    seed: int = 9300,
+) -> Image.Image:
+    """Geological agate cross-section: concentric warped bands like sliced
+    mineral strata.  Returns RGBA."""
+    rng = np.random.RandomState(seed)
+    if palette is None:
+        palette = [
+            (240, 235, 230), (180, 140, 100), (120, 60, 30),
+            (80, 45, 25), (55, 30, 50), (180, 160, 145),
+            (220, 200, 180), (100, 80, 110),
+        ]
+
+    # warped distance field from multiple off-centre origins
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float64) / size
+
+    n_origins = 3
+    dist = np.zeros((size, size), dtype=np.float64)
+    for _ in range(n_origins):
+        ox = 0.3 + rng.rand() * 0.4
+        oy = 0.3 + rng.rand() * 0.4
+        w = 0.5 + rng.rand() * 1.0
+        dist += np.sqrt((xs - ox) ** 2 + (ys - oy) ** 2) * w
+
+    # domain warp with noise
+    warp1 = _fbm_noise(size, 5, np.random.RandomState(seed + 10))
+    warp2 = _fbm_noise(size, 5, np.random.RandomState(seed + 20))
+    dist += (warp1 - 0.5) * 0.25 + (warp2 - 0.5) * 0.15
+
+    mn, mx = dist.min(), dist.max()
+    dist = (dist - mn) / (mx - mn + 1e-9)
+
+    band_idx = np.floor(dist * band_count).astype(np.int32) % band_count
+    frac = dist * band_count - np.floor(dist * band_count)
+
+    n_pal = len(palette)
+    out = np.zeros((size, size, 4), dtype=np.uint8)
+    for b in range(band_count):
+        mask = band_idx == b
+        col = palette[b % n_pal]
+        next_col = palette[(b + 1) % n_pal]
+        for ch in range(3):
+            blended = col[ch] + (next_col[ch] - col[ch]) * frac
+            out[:, :, ch] = np.where(mask, np.clip(blended, 0, 255).astype(np.uint8), out[:, :, ch])
+
+    # thin bright edge at each band boundary
+    edge_mask = np.clip(1.0 - np.minimum(frac, 1.0 - frac) / 0.04, 0, 1)
+    for ch in range(3):
+        out[:, :, ch] = np.clip(
+            out[:, :, ch].astype(np.float64) + edge_mask * 35, 0, 255
+        ).astype(np.uint8)
+
+    # subtle translucency variation
+    translucency = _fbm_noise(size, 3, np.random.RandomState(seed + 50))
+    out[:, :, 3] = np.clip(170 + translucency * 60, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(out, "RGBA")
+
+
+def generate_solar_flare(
+    size: int,
+    num_hotspots: int = 4,
+    num_streaks: int = 200,
+    palette: Optional[List[Tuple[int, int, int]]] = None,
+    seed: int = 9400,
+) -> Image.Image:
+    """Solar prominence / magnetic field line eruptions from hotspots on a
+    deep-space background.  Returns RGBA."""
+    rng = np.random.RandomState(seed)
+    if palette is None:
+        palette = [
+            (5, 2, 15),       # deep space
+            (120, 10, 5),     # dark corona
+            (220, 50, 0),     # flame
+            (255, 180, 20),   # yellow
+            (255, 255, 200),  # white-hot core
+        ]
+
+    # dark base
+    out = np.zeros((size, size, 3), dtype=np.float64)
+    out[:, :, 0] = palette[0][0]
+    out[:, :, 1] = palette[0][1]
+    out[:, :, 2] = palette[0][2]
+
+    ys, xs = np.mgrid[0:size, 0:size].astype(np.float64)
+
+    # place hotspots
+    hx = rng.randint(size // 6, 5 * size // 6, num_hotspots).astype(np.float64)
+    hy = rng.randint(size // 6, 5 * size // 6, num_hotspots).astype(np.float64)
+
+    # radial glow around each hotspot
+    for i in range(num_hotspots):
+        dist = np.sqrt((xs - hx[i]) ** 2 + (ys - hy[i]) ** 2) / size
+        glow = np.exp(-dist * 6.0) * (0.7 + rng.rand() * 0.5)
+        n_pal = len(palette)
+        t = np.clip(glow, 0, 1)
+        idx_f = t * (n_pal - 1)
+        idx_lo = np.floor(idx_f).astype(np.int32)
+        idx_hi = np.minimum(idx_lo + 1, n_pal - 1)
+        frac = idx_f - idx_lo
+        for ch in range(3):
+            lo_c = np.array([palette[j][ch] for j in range(n_pal)], dtype=np.float64)
+            contrib = lo_c[idx_lo] * (1 - frac) + lo_c[idx_hi] * frac
+            out[:, :, ch] = np.maximum(out[:, :, ch], contrib)
+
+    # plasma streaks using curved lines
+    img = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
+    draw = ImageDraw.Draw(img)
+
+    for _ in range(num_streaks):
+        hi = rng.randint(0, num_hotspots)
+        sx, sy = float(hx[hi]), float(hy[hi])
+
+        angle = rng.rand() * 2 * math.pi
+        length = size * (0.08 + rng.rand() * 0.35)
+        segments = rng.randint(5, 12)
+
+        points = [(sx, sy)]
+        cx, cy_pt = sx, sy
+        for s in range(segments):
+            angle += (rng.rand() - 0.5) * 1.2
+            step = length / segments
+            cx += math.cos(angle) * step
+            cy_pt += math.sin(angle) * step
+            points.append((cx, cy_pt))
+
+        t_val = rng.rand()
+        n_pal = len(palette)
+        pidx = min(int(t_val * (n_pal - 1)), n_pal - 2)
+        frac_t = t_val * (n_pal - 1) - pidx
+        col = tuple(
+            int(palette[pidx][ch] * (1 - frac_t) + palette[pidx + 1][ch] * frac_t)
+            for ch in range(3)
+        )
+        alpha_val = int(60 + rng.rand() * 120)
+        width = rng.randint(1, max(2, size // 400))
+
+        if len(points) >= 2:
+            draw.line(points, fill=col + (alpha_val,), width=width)
+
+    # final radial bloom pass
+    bloom = img.filter(ImageFilter.GaussianBlur(size // 60))
+    img = Image.alpha_composite(img, bloom)
+
+    arr = np.array(img)
+    arr[:, :, 3] = np.clip(
+        np.max(arr[:, :, :3], axis=2).astype(np.int32) // 2 + 140, 0, 255
+    ).astype(np.uint8)
+    return Image.fromarray(arr, "RGBA")
+
+
+# =============================================================================
+# UV ISLAND MASK EXTRACTION
+# =============================================================================
+
+_UV_ATLAS_JSON = Path("assets/uv_atlas/standard_stadium_islands_2048.json")
+_UV_DIAG_PNG = Path("assets/uv_atlas/diagnostics_2048.png")
+
+
+def build_robust_island_masks(size=2048):
+    """Build per-island masks from the atlas diagnostics image.
+
+    Samples expanding neighborhoods around each island center, validates
+    candidate colors against pixel count threshold, tracks used colors to
+    prevent cross-island confusion.
+    """
+    diag = np.array(Image.open(_UV_DIAG_PNG).convert("RGB"))
+    BG = np.array([8, 8, 12])
+    WHITE = np.array([255, 255, 255])
+
+    with open(_UV_ATLAS_JSON) as f:
+        atlas = json.load(f)
+
+    used_colors = set()
+    masks = {}
+    MIN_PIXELS = 500
+
+    for isl in atlas["islands"]:
+        iid = isl["id"]
+        cx, cy = isl["center"]
+        x0, y0, x1, y1 = isl["bbox"]
+        bw, bh = x1 - x0, y1 - y0
+
+        best_color = None
+        best_count = 0
+
+        max_r = max(bw, bh) // 2
+        radii = [0, 2, 5, 10, 20, 40, 80, 120, max_r]
+        for radius in radii:
+            r_y0 = max(y0, cy - radius)
+            r_y1 = min(y1, cy + radius + 1)
+            r_x0 = max(x0, cx - radius)
+            r_x1 = min(x1, cx + radius + 1)
+
+            patch = diag[r_y0:r_y1, r_x0:r_x1]
+            pixels = patch.reshape(-1, 3)
+
+            not_bg = np.abs(pixels.astype(int) - BG).sum(axis=1) > 20
+            not_white = np.abs(pixels.astype(int) - WHITE).sum(axis=1) > 20
+            valid = pixels[not_bg & not_white]
+            if len(valid) == 0:
+                continue
+
+            color_tuples = [tuple(c) for c in valid]
+            counts = Counter(color_tuples)
+
+            for color, _ in counts.most_common(10):
+                if color in used_colors:
+                    continue
+                full_diff = np.abs(diag.astype(int) - np.array(color)).sum(axis=2)
+                full_count = int((full_diff < 30).sum())
+                if full_count > best_count:
+                    best_color = color
+                    best_count = full_count
+
+            if best_count >= MIN_PIXELS:
+                break
+
+        if best_count < MIN_PIXELS:
+            mx = max(2, bw // 10)
+            my = max(2, bh // 10)
+            inner = diag[y0 + my:y1 - my, x0 + mx:x1 - mx]
+            pixels = inner.reshape(-1, 3)
+            not_bg = np.abs(pixels.astype(int) - BG).sum(axis=1) > 20
+            not_white = np.abs(pixels.astype(int) - WHITE).sum(axis=1) > 20
+            valid = pixels[not_bg & not_white]
+            if len(valid) > 0:
+                for color, _ in Counter([tuple(c) for c in valid]).most_common(10):
+                    if color in used_colors:
+                        continue
+                    full_diff = np.abs(diag.astype(int) - np.array(color)).sum(axis=2)
+                    full_count = int((full_diff < 30).sum())
+                    if full_count > best_count:
+                        best_color = color
+                        best_count = full_count
+                    if best_count >= MIN_PIXELS:
+                        break
+
+        if best_color is None or best_count < 10:
+            continue
+
+        used_colors.add(best_color)
+        diff = np.abs(diag.astype(int) - np.array(best_color)).sum(axis=2)
+        mask_arr = (diff < 30).astype(np.uint8) * 255
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        if size != 2048:
+            mask_img = mask_img.resize((size, size), Image.Resampling.NEAREST)
+        masks[iid] = mask_img
+
+    return masks
+

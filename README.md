@@ -1,105 +1,81 @@
-# Cavern Hunters - TMUF/TMNF Skin Generator
+# TM_CARS -- Procedural Skin Generator for TMNF/TMUF
 
-Custom Stadium car skin generator for **Cavern Hunters** team.
+Generates complete `.zip` skin packs for TrackMania Nations Forever / United Forever,
+ready to drop into the game's `Skins/Vehicles/StadiumCar/` folder.
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-python3 -m pip install -r requirements.txt
-
-# Generate a team skin
-python3 generate_tmnf_skin.py \
-  --name "CH_IceFade" \
-  --base-zip "examples/KACKIEST-KACKY-10-SKIN-(dark-gray)_by_MINA_TM.zip" \
-  --out out \
-  --logo cavern_final_logo.png \
-  --team-name "Cavern Hunters" \
-  --tag "CH" \
-  --style fade \
-  --base-color "#0a1828ff" \
-  --accent-color "#4fc3f7ff" \
-  --stripe-color "#e1f5feff" \
-  --wheel-color "#4fc3f7" \
-  --nose-logo --proj-logo
+pip install -r requirements.txt
+python3 generate_creative_skins.py
 ```
 
-## Generate player-specific skin (custom wing text)
+Output lands in `out/<skin_name>.zip`.
 
-```bash
-python3 generate_tmnf_skin.py \
-  --name "CH_PlayerName" \
-  --base-zip "examples/KACKIEST-KACKY-10-SKIN-(dark-gray)_by_MINA_TM.zip" \
-  --out out \
-  --logo cavern_final_logo.png \
-  --team-name "Cavern Hunters" \
-  --tag "CH" \
-  --wing-text "CH >> PlayerName" \
-  --style fade_splatter \
-  --base-color "#151618ff" \
-  --accent-color "#4a4d52ff" \
-  --stripe-color "#f0f2f5ff" \
-  --wheel-color "#f0f2f5" \
-  --nose-logo --proj-logo
+## How It Works
+
+1. A **pattern generator** function produces a 2048x2048 RGBA image (the body paint).
+2. `ProSkinEngine` composites it onto the car's UV layout, generates dirt maps, encodes DDS textures with mipmaps, and packages everything into a game-ready ZIP.
+3. Optionally, `tire_customizer` paints custom wheel spokes, sidewall brand text, and accent-colored tire shoulders onto `Details.dds`.
+
+## Creating a Skin
+
+In `generate_creative_skins.py`, call `build_skin()`:
+
+```python
+from generate_creative_skins import build_skin
+
+# Minimal -- just a pattern
+build_skin("my_skin", my_pattern_function)
+
+# With custom tires
+build_skin("my_skin", my_pattern_function, tire_config=dict(
+    brand_text="BRIDGESTONE",
+    model_text="POTENZA",
+    accent_color=(0, 200, 210),
+    spoke_count=12,
+))
 ```
 
-## Available Styles
+### tire_config options
 
-- `solid` - Clean single color
-- `fade` - Gradient fade (Kacky-style dithered)
-- `fade_splatter` - Fade + splatter texture overlay
-- `splatter` - Splatter/halftone texture
-- `fluid` - Fluid/marble swirls
-- `topo` - Topographic contour lines
-- `carbon` - Carbon fiber texture
-- `galaxy` - Starfield/nebula effect
-- `neon` - Neon glow lines
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `brand_text` | `"BRIDGESTONE"` | Upper sidewall arc text |
+| `model_text` | `"POTENZA"` | Lower sidewall arc text |
+| `text_color` | `(220, 220, 225, 240)` | RGBA for sidewall text |
+| `accent_color` | `(0, 200, 210)` | RGB for tire shoulder band |
+| `rubber_color` | `(18, 18, 22)` | RGB for tire rubber |
+| `spoke_color` | `(200, 203, 210)` | RGB for wheel spokes |
+| `spoke_bg_color` | `(75, 78, 85)` | RGB between spokes |
+| `spoke_count` | `12` | Number of spokes |
+| `caliper_color` | `None` | Optional brake caliper tint |
+| `lugnut_color` | `None` | Optional lug nut tint |
 
-## Research / Documentation
+## Project Structure
 
-- `docs/TMNF_SKINNING_NOTES.md`: living research log + file/channel semantics + links.
+```
+generate_creative_skins.py   -- Entry point and pattern generators
+pro_skin_engine.py           -- Core engine (UV compositing, DDS, ZIP)
+tire_customizer.py           -- Tire/wheel customization for Details.dds
+car_geometry.py              -- UV island classification and roles
+layer_stack.py               -- Layer compositing with blend modes
+skin_utils.py                -- Procedural pattern generators and helpers
+tmnf_dds.py                  -- DDS encoding (DXT1/DXT5 with mipmaps)
+palette_lab.py               -- OKLCH color utilities
+assets/
+  base_car/CH_2026.zip       -- Base car pack (meshes + default textures)
+  masks/                     -- Paint and chassis masks
+  uv_atlas/                  -- UV island atlas (JSON + diagnostic PNG)
+models/
+  StadiumCar.obj             -- Reference mesh for UV polygon extraction
+stickers/                    -- Sticker/logo images for pattern use
+tools/                       -- Validation and preview utilities
+out/                         -- Generated skins (gitignored)
+```
 
-## Refined workflow (TL;DR)
-
-Recommended: **reskin a known-good Stadium base zip** (keeps model files, avoids compatibility issues).
-
-- **Diffuse alpha**: treated as **finish/spec**, not transparency (neutral baseline often `0x8E`).
-- **Dirty + Illum**: generators/packagers will **auto-add** these if missing in the donor zip:
-  - `DiffuseDirty.dds` / `DetailsDirty.dds`: default “no dirt” (alpha=0), DXT5
-  - `Illum.dds`: default “no illum” (RGB=0), DXT1
-
-### Useful knobs
-
-- **Prelight shading**: `--prelight <png/tga> --prelight-strength 0.35..1.0`
-- **Finish looks “inverted”** (pack-dependent): `--finish-invert` (applies to `--finish-alpha auto`)
-- **Advanced glow** (baked illum): `--illum-image <png/tga>`
-
-## Skin Sharing (TMUF)
-
-For other players to see your skin in multiplayer, you need `.loc` files.
-
-### Setup:
-1. Download skins from `out/` folder
-2. Download matching `.loc` files from `loc/` folder
-3. Place both in: `Documents/TrackMania United/Skins/Vehicles/StadiumCar/`
-
-The `.loc` file tells the game where to download the skin from when other players encounter you.
-
-## Pre-made Skins
-
-| Skin | Style | Download |
-|------|-------|----------|
-| CH_DarkGreyWhiteFade_Team | Fade + Splatter | [zip](out/CH_DarkGreyWhiteFade_Team.zip) |
-| CH_IceFade_Frost | Ice Fade | [zip](out/CH_IceFade_Frost.zip) |
-| CH_OceanTeal_Fluid | Ocean Fluid | [zip](out/CH_OceanTeal_Fluid.zip) |
-| CH_EmberVolcanic_Topo | Volcanic Topo | [zip](out/CH_EmberVolcanic_Topo.zip) |
-| CH_MidnightGold_Carbon | Purple/Gold Carbon | [zip](out/CH_MidnightGold_Carbon.zip) |
-
-## Requirements
+## Dependencies
 
 - Python 3.9+
-- Pillow
-
-```bash
-pip install -r requirements.txt
-```
+- Pillow, NumPy, SciPy (see `requirements.txt`)
+- .NET SDK (only if using `tools/remove_guards/` for mudguard removal)
