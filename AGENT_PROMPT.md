@@ -79,12 +79,95 @@ You will continuously, across many turns:
   not silently break their visual output. If you change the shared
   pipeline, re-render them and diff.
 
+# Reference Corpus
+
+The corpus is the empirical ground truth for "what a good TMNF skin
+looks like." Every aesthetic judgment is grounded in it, not in the
+judge model's free-floating taste.
+
+## Sources
+
+1. **In-repo skin zips.** Every `.zip` under `out/` and any historical
+   skins recoverable from prior commits. These are *our* baseline --
+   represent both successes and failures. Tag each one with
+   `class: baseline_pass | baseline_fail | reference` based on whether
+   we'd ship it again today.
+2. **trackmania-skins.com TMNF skins.** Pull from
+   `https://trackmania-skins.com/skins?t=TMNF`. These are
+   community-curated TMNF Stadium-car skins -- the de facto top
+   reference set for what TMNF players actually consider good. Pull
+   metadata (title, author, tags, vote count if available) and the
+   skin zip if downloadable; if only preview images are available,
+   cache the preview images.
+
+## Layout
+
+```
+docs/references/
+  manifest.json              # one record per corpus entry
+  in_repo/
+    <skin_name>/
+      Diffuse.png            # raw flat preview
+      angle_front34.png      # rendered through gbx.tools or local 3D
+      angle_rear34.png
+      angle_topdown.png
+      angle_side.png
+      meta.json              # source, class, tags, palette summary
+  external/
+    tmskins_<id>/
+      ...same layout...
+      source_url.txt
+```
+
+## Bootstrap (run once, then keep fresh)
+
+1. Walk `out/*.zip` -> extract Diffuse.dds, render four canonical
+   angles via the local 3D previewer (or gbx.tools if local viewer
+   isn't ready), populate `in_repo/`.
+2. Scrape `https://trackmania-skins.com/skins?t=TMNF` paginated.
+   For each entry: download zip if available, otherwise grab the
+   site's preview images. Render canonical angles when zip is
+   available; otherwise use the site previews directly. Populate
+   `external/`. Respect the site's robots.txt and rate-limit to
+   1 request / 2 s.
+3. Build `manifest.json`: per entry, store
+   {id, source, class, palette_dominant_hsv (top 5), palette_pHash,
+    angle_pHashes, CLIP_embedding, has_zip, source_url, tags}.
+
+## Refresh cadence
+
+- Re-scrape the external source weekly, or whenever the agent ships
+  10 new skins, whichever comes first.
+- Re-bootstrap `in_repo/` whenever new skins land in `out/`.
+- Re-judging an old skin (trust-calibration check) re-uses the cached
+  captures unless the renderer changed; if it changed, re-render.
+
+## How the corpus is used
+
+- **Originality gate (rubric axis 7):** an originality score is
+  computed as the mean nearest-neighbour distance in
+  CLIP-embedding space between the candidate's four angle captures
+  and the *entire* corpus, weighted 1.5x for `external/` (community
+  references) and 1.0x for `in_repo/`.
+- **Per-axis percentile context:** when scoring axes 1-6, the
+  judge is shown corpus percentile statistics so "good contrast"
+  means "contrast at or above the 75th percentile of the external
+  set", not the model's gut feeling.
+- **Conviction calibration (axis 8):** before generating a concept,
+  search the corpus for the 3 nearest neighbours by tag/palette;
+  if any are within distance 0.15 in CLIP space, the concept is
+  too close to existing work -- pick a different concept.
+- **Negative training signal:** entries tagged `class: baseline_fail`
+  are anti-references. The candidate must score at *least* 0.20
+  CLIP-distance from every fail-tagged entry, or it's rejected
+  before it even reaches axis scoring.
+
 # Aesthetic Judgment
 
 You are a fully autonomous judge of your own output. There is no human
-gate and no curated reference corpus, so the rubric below is the entire
-quality bar. Apply it ruthlessly; reject and re-roll until the score
-clears the threshold. Do not lower the threshold.
+gate; the corpus + rubric below are the entire quality bar. Apply it
+ruthlessly; reject and re-roll until the score clears the threshold.
+Do not lower the threshold.
 
 ## Process
 
@@ -129,11 +212,13 @@ free-text justification per axis) as
    alpha channel of Diffuse was painted with intent (verified against
    the alpha histogram from the Verification block). Score 0 if the
    car looks "printed on" rather than "painted on".
-7. **Originality vs in-repo baseline.** Compute average perceptual
-   hash distance (pHash, dHash, or CLIP-embedding cosine) of this
-   skin's four captures against every existing skin's captures in
-   `docs/captures/`. Score 5 if mean distance > 0.35, score 0 if
-   mean distance < 0.10. We are not shipping near-duplicates.
+7. **Originality vs corpus.** Compute mean nearest-neighbour CLIP
+   distance of this skin's four captures against the full Reference
+   Corpus (`docs/references/in_repo/` + `docs/references/external/`),
+   weighted 1.5x for external (community-curated trackmania-skins.com
+   entries) and 1.0x for in-repo. Score 5 if weighted mean distance
+   > 0.35, score 0 if < 0.10. We are not shipping near-duplicates of
+   either our own work or the community's.
 8. **Theme conviction.** The skin commits to a single, nameable
    visual concept (e.g. "kintsugi gold-vein on lacquered black",
    "thermal-vision predator", "circuit-board fluorescing under UV").
