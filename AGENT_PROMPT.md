@@ -92,13 +92,19 @@ judge model's free-floating taste.
    represent both successes and failures. Tag each one with
    `class: baseline_pass | baseline_fail | reference` based on whether
    we'd ship it again today.
-2. **trackmania-skins.com TMNF skins.** Pull from
-   `https://trackmania-skins.com/skins?t=TMNF`. These are
+2. **External seed (hand-curated, permanent).** Community TMNF skins
+   already vendored under `docs/references/external_seed/`. Restored
+   from commit `0eeb862` (formerly `examples/`). Authors include
+   MINA_TM, SparkyTM, WiiTRO. **Never auto-delete or overwrite this
+   folder** -- it is the permanent reference floor. See its README
+   for grouping (canonical / no_mudguard / not_car gimmicks).
+3. **trackmania-skins.com TMNF skins (auto-scraped, refreshing).**
+   Pull from `https://trackmania-skins.com/skins?t=TMNF`. These are
    community-curated TMNF Stadium-car skins -- the de facto top
    reference set for what TMNF players actually consider good. Pull
    metadata (title, author, tags, vote count if available) and the
    skin zip if downloadable; if only preview images are available,
-   cache the preview images.
+   cache the preview images. Lives under `docs/references/external/`.
 
 ## Layout
 
@@ -113,7 +119,13 @@ docs/references/
       angle_topdown.png
       angle_side.png
       meta.json              # source, class, tags, palette summary
-  external/
+  external_seed/             # hand-curated, permanent (see its README)
+    <skin_basename>/
+      skin.zip
+      origin.txt
+      angle_*.png            # populated by bootstrap
+      meta.json
+  external/                  # auto-scraped from trackmania-skins.com
     tmskins_<id>/
       ...same layout...
       source_url.txt
@@ -147,8 +159,8 @@ docs/references/
 - **Originality gate (rubric axis 7):** an originality score is
   computed as the mean nearest-neighbour distance in
   CLIP-embedding space between the candidate's four angle captures
-  and the *entire* corpus, weighted 1.5x for `external/` (community
-  references) and 1.0x for `in_repo/`.
+  and the *entire* corpus, weighted 1.5x for `external_seed/` and
+  `external/` (community references) and 1.0x for `in_repo/`.
 - **Per-axis percentile context:** when scoring axes 1-6, the
   judge is shown corpus percentile statistics so "good contrast"
   means "contrast at or above the 75th percentile of the external
@@ -214,11 +226,10 @@ free-text justification per axis) as
    car looks "printed on" rather than "painted on".
 7. **Originality vs corpus.** Compute mean nearest-neighbour CLIP
    distance of this skin's four captures against the full Reference
-   Corpus (`docs/references/in_repo/` + `docs/references/external/`),
-   weighted 1.5x for external (community-curated trackmania-skins.com
-   entries) and 1.0x for in-repo. Score 5 if weighted mean distance
-   > 0.35, score 0 if < 0.10. We are not shipping near-duplicates of
-   either our own work or the community's.
+   Corpus (`docs/references/in_repo/` + `external_seed/` + `external/`),
+   weighted 1.5x for the two external sets and 1.0x for in-repo. Score
+   5 if weighted mean distance > 0.35, score 0 if < 0.10. We are not
+   shipping near-duplicates of either our own work or the community's.
 8. **Theme conviction.** The skin commits to a single, nameable
    visual concept (e.g. "kintsugi gold-vein on lacquered black",
    "thermal-vision predator", "circuit-board fluorescing under UV").
